@@ -90,6 +90,162 @@ cd agent && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Open **http://localhost:8501**.
 
+## Testing each component independently
+
+Use this section when you want to test bottom-up instead of through the UI:
+backend alone → MCP server alone (via MCP Inspector) → agent alone → all
+three together. It assumes the three app registrations, scopes, and admin
+consent from `PREREQUISITES.md` already exist.
+
+### 0. Get test tokens
+
+You need real Entra access tokens to drive the backend or MCP server
+directly (no browser UI involved). `scripts/get_token.py` mints one via
+MSAL device-code flow - do the one-time setup in
+[`PREREQUISITES.md` step 6](./PREREQUISITES.md#step-6---enable-manual-token-testing-optional-for-scriptsget_tokenpy)
+first (enabling public client flows on `poc-agent`, or registering a
+throwaway `poc-test-client`), then:
+
+```
+cd scripts && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# An MCP-audience token (for testing the MCP server / agent's MCP call)
+.venv/bin/python get_token.py --client-id $AGENT_APP_CLIENT_ID \
+    --scope api://$MCP_APP_CLIENT_ID/access_as_user
+```
+
+This prints a device-code URL/code to stderr - open it, sign in as your
+test user, approve. Decoded claims (`aud`, `oid`, `scp`, ...) print to
+stderr for sanity-checking; the raw token prints alone to stdout, so you
+can capture it directly:
+
+```
+MCP_TOKEN=$(.venv/bin/python get_token.py --client-id $AGENT_APP_CLIENT_ID \
+    --scope api://$MCP_APP_CLIENT_ID/access_as_user)
+```
+
+A backend-audience token needs a client with permission to `poc-backend`
+directly - `poc-agent`/`poc-mcp` deliberately don't have that (see
+PREREQUISITES.md option B for a dedicated `poc-test-client`):
+
+```
+BACKEND_TOKEN=$(.venv/bin/python get_token.py --client-id $TEST_CLIENT_ID \
+    --scope api://$BACKEND_APP_CLIENT_ID/access_as_user)
+```
+
+### 1. Test the backend independently
+
+```
+cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m app.main          # http://127.0.0.1:8000
+```
+
+In another terminal:
+
+```
+# Public path - no token needed
+curl -i http://127.0.0.1:8000/public/health
+# -> 200 {"status":"ok","service":"poc-backend"}
+
+# Private path, no token
+curl -i http://127.0.0.1:8000/private/whoami
+# -> 401
+
+# Private path, real backend-audience token
+curl -i http://127.0.0.1:8000/private/whoami -H "Authorization: Bearer $BACKEND_TOKEN"
+# -> 200, your oid/preferred_username/scopes
+
+# Private path, wrong-audience token (audience-confusion rejection)
+curl -i http://127.0.0.1:8000/private/whoami -H "Authorization: Bearer $MCP_TOKEN"
+# -> 401, aud doesn't match poc-backend
+```
+
+Watch the backend's stdout/log: successful calls log `oid`/`aud`, never
+the token itself.
+
+### 2. Test the MCP server independently with MCP Inspector
+
+Keep the backend running (the MCP server's tools call it). Start the MCP
+server:
+
+```
+cd mcp_server && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python server.py            # http://127.0.0.1:8001/mcp
+```
+
+In another terminal, launch MCP Inspector (no install needed):
+
+```
+npx @modelcontextprotocol/inspector
+```
+
+This opens a local web UI (default `http://localhost:6274`). Configure:
+- **Transport type**: `Streamable HTTP`
+- **URL**: `http://127.0.0.1:8001/mcp`
+- **Authentication** → add a custom header: `Authorization: Bearer <MCP_TOKEN>`
+  (use the `$MCP_TOKEN` minted in step 0 - this is the audience the MCP
+  server's `JWTVerifier` actually accepts)
+
+Click **Connect**. You should see the connection succeed and authenticate
+(no auth header, or a backend-audience token, should fail to connect -
+worth trying once to confirm the rejection). Then:
+- Go to the **Tools** tab → **List Tools**. You should see `check_backend_health`
+  and `get_my_identity`.
+- Run `check_backend_health` with no arguments → expect the public health
+  payload back.
+- Run `get_my_identity` with no arguments → the MCP server performs the OBO
+  exchange server-side and returns your identity as resolved by the
+  *backend*. Watch `mcp_server`'s stdout: it logs the inbound call
+  (`tool=get_my_identity oid=...`) and the OBO target audience.
+- Try connecting with a `poc-backend`-audience token instead - Inspector
+  should fail to connect (401, audience mismatch), demonstrating rejection
+  in the other direction.
+
+### 3. Test the agent independently
+
+Keep the backend and MCP server running. Start the agent:
+
+```
+cd agent && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python app.py               # http://127.0.0.1:8501
+```
+
+Open `http://localhost:8501` in a browser:
+- You should be redirected to `login.microsoftonline.com`. Sign in as your
+  test user.
+- You land back on the chat UI showing your `preferred_username`.
+- Ask **"is the backend up?"** → expect a reply derived from `check_backend_health`.
+- Ask **"who am I?"** → expect your `oid`/`preferred_username` back, proving
+  the agent's MCP-audience token flowed through MCP's OBO exchange to the
+  backend and back.
+- Click logout (or `POST /auth/logout`), confirm you're bounced back to the
+  login page and a fresh visit requires signing in again.
+- Optional: open a second browser (or incognito window) as a different test
+  user and confirm the two chat sessions don't see each other's identity -
+  each holds its own server-side MSAL token cache keyed by an opaque
+  session cookie.
+
+### 4. Test all three together
+
+This is just step 3 with attention paid to the other two services' logs,
+to see the full chain end-to-end:
+
+```
+./run_local.sh
+```
+
+or the three manual commands above in three terminals. Then, while asking
+"who am I?" in the agent UI, tail the other two logs:
+
+```
+tail -f /tmp/poc-mcp_server.log /tmp/poc-backend.log
+```
+
+You should see the same `oid` appear in both, with the audience changing
+from poc-mcp to poc-backend between the two log lines - see
+["Logs show one oid, two audiences"](#4-logs-show-one-oid-two-audiences)
+below for exactly what to expect.
+
 ## Verify the chain (acceptance criteria)
 
 Each item below maps to a build-spec acceptance criterion.
