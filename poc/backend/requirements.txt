@@ -1,0 +1,4 @@
+fastapi==0.138.2
+uvicorn[standard]==0.49.0
+pyjwt[crypto]==2.13.0
+python-dotenv==1.2.2
