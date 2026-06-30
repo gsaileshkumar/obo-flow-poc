@@ -132,6 +132,33 @@ consent makes the demo flow uninterrupted.
 
 ---
 
+## Step 6 - Enable manual token testing (optional, for `scripts/get_token.py`)
+
+To test a component in isolation (e.g. `curl` the backend directly, or
+drive the MCP server with MCP Inspector) you need a real Entra access
+token without going through the agent's browser login. `scripts/get_token.py`
+does this via MSAL **device-code flow**, which needs a *public* client
+(no secret, no redirect URI). Pick one:
+
+**Option A - quick, reuses `poc-agent` (good enough for most testing):**
+
+1. `poc-agent` app registration → **Authentication** → scroll to **Advanced settings** → **Allow public client flows** → **Yes** → **Save**.
+2. This lets you mint **poc-mcp**-audience tokens (the scope `poc-agent` already has permission for) with `scripts/get_token.py --client-id $AGENT_APP_CLIENT_ID --scope api://$MCP_APP_CLIENT_ID/access_as_user`.
+3. `poc-agent` has **no** permission to request a `poc-backend`-audience token directly (by design - only `poc-mcp` can, via OBO), so this option alone does not let you mint a backend-audience token for direct backend testing. It's still enough to: test the MCP server standalone, and test that a backend token is rejected by MCP / that an MCP token is rejected by the backend (criterion 5 only needs one real token of each kind on hand, and you get the MCP-audience one this way - get a backend-audience one via Option B, or via the agent UI + OBO and decode it from the MCP server's downstream call - the cleanest source is Option B).
+
+**Option B - cleaner, a dedicated throwaway test client:**
+
+1. **App registrations** → **New registration** → name `poc-test-client` → single tenant → no redirect URI needed.
+2. **Authentication** → **Allow public client flows** → **Yes**.
+3. **API permissions** → **Add a permission** → **My APIs** → `poc-backend` → **Delegated** → `access_as_user` → **Add permissions**. Repeat for `poc-mcp` → `access_as_user`.
+4. **Grant admin consent** for both.
+5. Now `scripts/get_token.py --client-id <poc-test-client-id> --scope api://<backend-id>/access_as_user` and `... --scope api://<mcp-id>/access_as_user` both work, and none of this testing scaffolding touches the production apps' permission graphs (`poc-agent` and `poc-mcp` keep exactly the delegated permissions described in the identity model above).
+
+Delete `poc-test-client` when you're done, or just leave "Allow public
+client flows" off on the production apps if you only ever used Option B.
+
+---
+
 ## Troubleshooting setup itself
 
 - **"Need admin approval" on login**: the delegated permission exists but
